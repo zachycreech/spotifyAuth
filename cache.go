@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -122,13 +123,13 @@ func parseSpotifyNowPlaying(r *http.Response) (*TrackMeta, error) {
 	}, nil
 }
 
-func fetchSpotifyCurrentTrack(r *http.Request) (*TrackMeta, error) {
-	accessToken, err := getValidAccessToken(r.Context())
+func fetchSpotifyCurrentTrackCtx(ctx context.Context) (*TrackMeta, error) {
+	accessToken, err := getValidAccessToken(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, nowPlayURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nowPlayURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -141,6 +142,10 @@ func fetchSpotifyCurrentTrack(r *http.Request) (*TrackMeta, error) {
 	defer resp.Body.Close()
 
 	return parseSpotifyNowPlaying(resp)
+}
+
+func fetchSpotifyCurrentTrack(r *http.Request) (*TrackMeta, error) {
+	return fetchSpotifyCurrentTrackCtx(r.Context())
 }
 
 func (c *CacheState) updateCurrentTrack(track *TrackMeta) {
@@ -285,46 +290,74 @@ func warmWindowCache(track *TrackMeta) error {
 }
 
 func handleWindow(w http.ResponseWriter, r *http.Request) {
-	track, err := fetchSpotifyCurrentTrack(r)
-	if err != nil {
-		http.Error(w, "failed to fetch current track", http.StatusBadGateway)
+	if r.URL.Query().Get("live") == "1" {
+		track, err := fetchSpotifyCurrentTrack(r)
+		if err != nil {
+			http.Error(w, "failed to fetch current track", http.StatusBadGateway)
+			return
+		}
+
+		queue, err := fetchSpotifyQueue(r)
+		if err != nil {
+			http.Error(w, "failed to fetch queue", http.StatusBadGateway)
+			return
+		}
+
+		if err := warmWindowCacheWithQueue(track, queue); err != nil {
+			http.Error(w, "failed to warm cache", http.StatusBadGateway)
+			return
+		}
+
+		writeJSON(w, http.StatusOK, cacheState.buildWindowWithQueue(queue))
 		return
 	}
 
-	queue, err := fetchSpotifyQueue(r)
-	if err != nil {
-		http.Error(w, "failed to fetch queue", http.StatusBadGateway)
-		return
+	track, queue, _ := playbackState.snapshot()
+	cacheState.updateCurrentTrack(track)
+
+	window := cacheState.buildWindowWithQueue(queue)
+	// Ensure artwork is processed for any slots that claim to have art.
+	for _, t := range []*TrackMeta{window.Prev2.Track, window.Prev1.Track, window.Current.Track, window.Next1.Track, window.Next2.Track} {
+		_ = cacheState.ensureArtProcessed(t)
 	}
 
-	if err := warmWindowCacheWithQueue(track, queue); err != nil {
-		http.Error(w, "failed to warm cache", http.StatusBadGateway)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, cacheState.buildWindowWithQueue(queue))
+	writeJSON(w, http.StatusOK, window)
 }
 
 func handleArtworkBySlot(w http.ResponseWriter, r *http.Request) {
-	track, err := fetchSpotifyCurrentTrack(r)
-	if err != nil {
-		http.Error(w, "failed to fetch current track", http.StatusBadGateway)
-		return
-	}
+	if r.URL.Query().Get("live") == "1" {
+		track, err := fetchSpotifyCurrentTrack(r)
+		if err != nil {
+			http.Error(w, "failed to fetch current track", http.StatusBadGateway)
+			return
+		}
 
-	queue, err := fetchSpotifyQueue(r)
-	if err != nil {
-		http.Error(w, "failed to fetch queue", http.StatusBadGateway)
-		return
-	}
+		queue, err := fetchSpotifyQueue(r)
+		if err != nil {
+			http.Error(w, "failed to fetch queue", http.StatusBadGateway)
+			return
+		}
 
-	if err := warmWindowCacheWithQueue(track, queue); err != nil {
-		http.Error(w, "failed to warm cache", http.StatusBadGateway)
+		if err := warmWindowCacheWithQueue(track, queue); err != nil {
+			http.Error(w, "failed to warm cache", http.StatusBadGateway)
+			return
+		}
+
+		slot := r.URL.Query().Get("slot")
+		window := cacheState.buildWindowWithQueue(queue)
+		serveArtworkSlot(w, slot, window)
 		return
 	}
 
 	slot := r.URL.Query().Get("slot")
+	track, queue, _ := playbackState.snapshot()
+	cacheState.updateCurrentTrack(track)
 	window := cacheState.buildWindowWithQueue(queue)
+	serveArtworkSlot(w, slot, window)
+	return
+}
+
+func serveArtworkSlot(w http.ResponseWriter, slot string, window TrackWindow) {
 
 	var selected *TrackMeta
 	switch slot {
@@ -348,11 +381,24 @@ func handleArtworkBySlot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload, ok := cacheState.getArt(selected)
-	if !ok {
-		http.Error(w, "art not cached", http.StatusNotFound)
+	if payload, ok := cacheState.getArt(selected); ok {
+		writeArtworkPayload(w, selected, payload)
 		return
 	}
+
+	// Best-effort on-demand processing if the poller hasn't prewarmed yet.
+	_ = cacheState.ensureArtProcessed(selected)
+	if payload, ok := cacheState.getArt(selected); ok {
+		writeArtworkPayload(w, selected, payload)
+		return
+	}
+
+	http.Error(w, "art not cached", http.StatusNotFound)
+	return
+
+}
+
+func writeArtworkPayload(w http.ResponseWriter, selected *TrackMeta, payload []byte) {
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Width", "64")
@@ -363,13 +409,13 @@ func handleArtworkBySlot(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(payload)
 }
 
-func fetchSpotifyQueue(r *http.Request) ([]*TrackMeta, error) {
-	accessToken, err := getValidAccessToken(r.Context())
+func fetchSpotifyQueueCtx(ctx context.Context) ([]*TrackMeta, error) {
+	accessToken, err := getValidAccessToken(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, "https://api.spotify.com/v1/me/player/queue", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.spotify.com/v1/me/player/queue", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -439,6 +485,10 @@ func fetchSpotifyQueue(r *http.Request) ([]*TrackMeta, error) {
 	}
 
 	return out, nil
+}
+
+func fetchSpotifyQueue(r *http.Request) ([]*TrackMeta, error) {
+	return fetchSpotifyQueueCtx(r.Context())
 }
 
 func (c *CacheState) buildWindowWithQueue(queue []*TrackMeta) TrackWindow {

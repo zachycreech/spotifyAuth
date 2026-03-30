@@ -48,9 +48,11 @@ type TokenData struct {
 type NowPlayingResponse struct {
 	OK            bool    `json:"ok"`
 	IsPlaying     bool    `json:"is_playing"`
+	ID            *string `json:"id,omitempty"`
 	Title         *string `json:"title"`
 	Artist        *string `json:"artist"`
 	Album         *string `json:"album"`
+	ArtID         *string `json:"art_id,omitempty"`
 	ProgressMs    int     `json:"progress_ms"`
 	DurationMs    int     `json:"duration_ms"`
 	AlbumImageURL *string `json:"album_image_url"`
@@ -61,11 +63,14 @@ func main() {
 		log.Fatal("SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be set")
 	}
 
+	startPlaybackPoller()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleIndex)
 	mux.HandleFunc("/login", handleLogin)
 	mux.HandleFunc("/callback", handleCallback)
 	mux.HandleFunc("/nowplaying", handleNowPlaying)
+	mux.HandleFunc("/ws", handleWS)
 	mux.HandleFunc("/artwork", handleArtwork)
 	mux.HandleFunc("/preview", handlePreview)
 	mux.HandleFunc("/artwork-preview", handleArtworkPreview)
@@ -140,99 +145,61 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleNowPlaying(w http.ResponseWriter, r *http.Request) {
-	accessToken, err := getValidAccessToken(r.Context())
-	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{
-			"ok":    false,
-			"error": "not_authorized",
-			"login": "/login",
-		})
+	// Default behavior serves the last polled state (2s poll loop) so clients
+	// don't directly hit Spotify on every request.
+	if r.URL.Query().Get("live") == "1" {
+		track, err := fetchSpotifyCurrentTrackCtx(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"ok":    false,
+				"error": "not_authorized",
+				"login": "/login",
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, nowPlayingResponseFromTrack(track))
 		return
 	}
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, nowPlayURL, nil)
-	if err != nil {
-		http.Error(w, "request build failed", http.StatusInternalServerError)
-		return
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		http.Error(w, "spotify request failed", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNoContent {
-		writeJSON(w, http.StatusOK, NowPlayingResponse{
-			OK:         true,
-			IsPlaying:  false,
-			ProgressMs: 0,
-			DurationMs: 0,
-		})
-		return
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		writeJSON(w, resp.StatusCode, map[string]any{
-			"ok":          false,
-			"status_code": resp.StatusCode,
-			"body":        string(body),
-		})
-		return
-	}
-
-	var raw struct {
-		IsPlaying  bool `json:"is_playing"`
-		ProgressMs int  `json:"progress_ms"`
-		Item       struct {
-			Name       string `json:"name"`
-			DurationMs int    `json:"duration_ms"`
-			Artists    []struct {
-				Name string `json:"name"`
-			} `json:"artists"`
-			Album struct {
-				Name   string `json:"name"`
-				Images []struct {
-					URL string `json:"url"`
-				} `json:"images"`
-			} `json:"album"`
-		} `json:"item"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		http.Error(w, "failed to parse spotify response", http.StatusBadGateway)
-		return
-	}
-
-	var artistNames []string
-	for _, a := range raw.Item.Artists {
-		if a.Name != "" {
-			artistNames = append(artistNames, a.Name)
+	track, _, updatedAt := playbackState.snapshot()
+	if track == nil && updatedAt.IsZero() {
+		if errStr, _ := playbackState.pollError(); errStr != "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"ok":    false,
+				"error": "not_authorized",
+				"login": "/login",
+			})
+			return
 		}
 	}
 
-	title := raw.Item.Name
-	artist := strings.Join(artistNames, ", ")
-	album := raw.Item.Album.Name
+	writeJSON(w, http.StatusOK, nowPlayingResponseFromTrack(track))
+}
 
-	var imageURL *string
-	if len(raw.Item.Album.Images) > 0 && raw.Item.Album.Images[0].URL != "" {
-		imageURL = &raw.Item.Album.Images[0].URL
+func nowPlayingResponseFromTrack(track *TrackMeta) NowPlayingResponse {
+	if track == nil {
+		return NowPlayingResponse{OK: true, IsPlaying: false, ProgressMs: 0, DurationMs: 0}
 	}
 
-	writeJSON(w, http.StatusOK, NowPlayingResponse{
+	id := track.ID
+	artID := track.ArtID
+	title := track.Title
+	artist := track.Artist
+	album := track.Album
+	imageURL := track.AlbumImageURL
+
+	return NowPlayingResponse{
 		OK:            true,
-		IsPlaying:     raw.IsPlaying,
+		IsPlaying:     track.IsPlaying,
+		ID:            strPtrOrNil(id),
 		Title:         strPtrOrNil(title),
 		Artist:        strPtrOrNil(artist),
 		Album:         strPtrOrNil(album),
-		ProgressMs:    raw.ProgressMs,
-		DurationMs:    raw.Item.DurationMs,
-		AlbumImageURL: imageURL,
-	})
+		ArtID:         strPtrOrNil(artID),
+		ProgressMs:    track.ProgressMs,
+		DurationMs:    track.DurationMs,
+		AlbumImageURL: strPtrOrNil(imageURL),
+	}
 }
 
 func exchangeCodeForToken(ctx context.Context, code string) (*TokenData, error) {
