@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"hash/crc32"
 	"image"
 	"io"
 	"net/http"
+	"strconv"
 )
 
 const (
@@ -23,8 +25,8 @@ func imageToRGB565(img image.Image) []byte {
 
 	out := make([]byte, 0, width*height*2)
 
-	for y := range height {
-		for x := range width {
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
 			r, g, b, _ := img.At(bounds.Min.X+x, bounds.Min.Y+y).RGBA()
 			r8 := uint8(r >> 8)
 			g8 := uint8(g >> 8)
@@ -112,13 +114,14 @@ func handleArtwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("X-Width", "64")
-	w.Header().Set("X-Height", "64")
-	w.Header().Set("X-Format", "rgb565-be")
-	if data.Item.ID != "" {
-		w.Header().Set("X-Track-Id", data.Item.ID)
-	}
+	checksum := crc32.ChecksumIEEE(payload)
+
+	h := w.Header()
+	h.Set("Content-Type", "application/octet-stream")
+	h.Set("Content-Length", strconv.Itoa(len(payload)))
+	h.Set("X-CRC32", strconv.FormatUint(uint64(checksum), 10))
+	h.Set("Cache-Control", "no-store")
+	h.Set("Connection", "close")
 
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(payload)

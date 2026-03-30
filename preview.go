@@ -1,15 +1,15 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
-	"image/png"
 	_ "image/jpeg"
+	"image/png"
 	_ "image/png"
 	"net/http"
 	"os"
-	"encoding/json"
 
 	"golang.org/x/image/draw"
 )
@@ -148,8 +148,6 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 
 	w.Write([]byte("preview generated\n"))
 }
-
-
 
 func rgb565ToImage(data []byte, width, height int) *image.RGBA {
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
